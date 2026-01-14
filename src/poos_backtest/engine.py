@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date
 import pandas as pd
 import numpy as np
+from collections import Counter, defaultdict
 
 from .indicators import ema, atr, percent_change, safe_div
 
@@ -31,7 +32,6 @@ class Trade:
     reason: str
 
 def _slip(price: float, bps: float, is_buy: bool) -> float:
-    # buy worse (higher), sell worse (lower)
     mult = 1.0 + (bps / 10000.0) if is_buy else 1.0 - (bps / 10000.0)
     return price * mult
 
@@ -57,8 +57,10 @@ def run_backtest(
 ) -> tuple[pd.DataFrame, list[Trade]]:
     """
     Daily bar approximation.
-    All dfs must have: date, open, high, low, close, volume and be aligned by date.
+    Returns: equity_df, trades
+    Additionally logs diagnostics about filters.
     """
+
     # Prepare SPY indicators
     spy = spy.copy()
     spy["ema5"] = ema(spy["close"], 5)
@@ -90,27 +92,32 @@ def run_backtest(
 
     equity_rows = []
 
+    # Diagnostics
+    diag_totals = Counter()
+    diag_by_day = defaultdict(Counter)
+
     for i, day in enumerate(dates):
         # mark-to-market
         mkt_value = 0.0
         for pos in positions.values():
-            px = prepared[pos.ticker].loc[i, "close"]
+            px = float(prepared[pos.ticker].iloc[i]["close"])
             mkt_value += pos.shares * px
         equity = cash + mkt_value
 
-        # market regime
         risk_on = bool(spy.loc[i, "risk_on"])
-        # manage open positions first (stops & BE)
-        to_close: list[tuple[str, float, str]] = []
-        for t, pos in positions.items():
-            row = prepared[t].iloc[i]
-            o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
 
-            # BE move at +1%
+        # manage open positions (stops & BE)
+        to_close: list[tuple[str, float, str]] = []
+        for t, pos in list(positions.items()):
+            row = prepared[t].iloc[i]
+            h = float(row["high"])
+            l = float(row["low"])
+
+            # Move to BE at +1%
             if (not pos.breakeven_set) and (h >= pos.entry_price * 1.01):
                 pos.stop_price = pos.entry_price
                 pos.breakeven_set = True
-                last_trade_unlocked = True  # unlock new trades once any open pos hits BE
+                last_trade_unlocked = True
 
             # Stop hit?
             if l <= pos.stop_price <= h:
@@ -141,67 +148,99 @@ def run_backtest(
         # update equity after closes
         mkt_value = 0.0
         for pos in positions.values():
-            px = prepared[pos.ticker].loc[i, "close"]
+            px = float(prepared[pos.ticker].iloc[i]["close"])
             mkt_value += pos.shares * px
         equity = cash + mkt_value
 
-        # Entry logic: only if risk_on, and "green garden" allows
+        # Entries only if allowed
+        if not risk_on:
+            diag_totals["market_risk_off_day"] += 1
+            diag_by_day[day]["market_risk_off_day"] += 1
+        if not last_trade_unlocked:
+            diag_totals["garden_locked_day"] += 1
+            diag_by_day[day]["garden_locked_day"] += 1
+
         if risk_on and last_trade_unlocked:
             candidates = []
+            day_reasons = Counter()
+
             for t, df in prepared.items():
                 if t in positions:
+                    day_reasons["already_in_position"] += 1
                     continue
+
                 row = df.iloc[i]
-                if np.isnan(row["ema20"]) or np.isnan(row["atr14"]) or np.isnan(row["perf_3m"]):
+                if np.isnan(row["ema20"]) or np.isnan(row["atr14"]) or np.isnan(row["perf_3m"]) or np.isnan(row["ema21"]):
+                    day_reasons["not_enough_history"] += 1
                     continue
 
                 # Stock filters
                 if float(row["close"]) > price_max:
-                    continue
-                if float(row["dollar_vol"]) < min_dollar_volume:
-                    continue
-                if float(row["perf_3m"]) < perf_3m_min:
+                    day_reasons["price_above_max"] += 1
                     continue
 
-                # Sector filters
+                if float(row["dollar_vol"]) < min_dollar_volume:
+                    day_reasons["dollar_vol_below_min"] += 1
+                    continue
+
+                if float(row["perf_3m"]) < perf_3m_min:
+                    day_reasons["perf_3m_below_min"] += 1
+                    continue
+
                 sec = ticker_to_sector.get(t)
-                if not sec or sec not in sector_dfs:
+                if not sec:
+                    day_reasons["no_sector_mapping"] += 1
+                    continue
+                if sec not in sector_dfs:
+                    day_reasons["sector_etf_missing"] += 1
                     continue
                 if not bool(sector_dfs[sec].iloc[i]["sec_strong"]):
+                    day_reasons["sector_not_strong"] += 1
                     continue
 
-                # Stock relative strength to sector
-                sec_close = float(sector_dfs[sec].iloc[i]["close"])
-                rs = float(row["close"]) / sec_close if sec_close > 0 else np.nan
-                # RS trend: compare to previous day (simple proxy)
+                # Stock relative strength to sector (simple 1-day trend proxy)
                 if i == 0:
+                    day_reasons["rs_no_prev"] += 1
                     continue
-                prev_rs = float(prepared[t].iloc[i-1]["close"]) / float(sector_dfs[sec].iloc[i-1]["close"])
+                sec_close = float(sector_dfs[sec].iloc[i]["close"])
+                prev_sec_close = float(sector_dfs[sec].iloc[i - 1]["close"])
+                if sec_close <= 0 or prev_sec_close <= 0:
+                    day_reasons["rs_bad_sector_price"] += 1
+                    continue
+                rs = float(row["close"]) / sec_close
+                prev_rs = float(df.iloc[i - 1]["close"]) / prev_sec_close
                 if not (rs > prev_rs):
+                    day_reasons["rs_not_up"] += 1
                     continue
 
-                # POOS limit entry
+                # POOS entry
                 limit_px = float(row["ema20"])
-                gap_ok = float(row["open"]) >= float(row["ema21"])
-                if not gap_ok:
+                if float(row["open"]) < float(row["ema21"]):
+                    day_reasons["gap_below_ema21"] += 1
                     continue
                 if not (float(row["low"]) <= limit_px <= float(row["high"])):
+                    day_reasons["no_touch_ema20"] += 1
                     continue
 
                 candidates.append((t, limit_px))
 
-            # optional: choose best by perf_3m (strongest "monster")
-            if candidates:
+            # Aggregate reasons (for days with no trade)
+            if not candidates:
+                # take top 5 reasons that day
+                for k, v in day_reasons.items():
+                    diag_totals[k] += v
+                    diag_by_day[day][k] += v
+            else:
+                # Choose strongest by 3M perf
                 candidates.sort(key=lambda x: float(prepared[x[0]].iloc[i]["perf_3m"]), reverse=True)
                 t, limit_px = candidates[0]
 
-                # Position sizing
                 a = float(prepared[t].iloc[i]["atr14"])
                 stop_px = limit_px - a
                 if stop_px <= 0:
                     stop_px = limit_px * 0.9
-                risk_per_share = max(0.01, limit_px - stop_px)
 
+                risk_per_share = max(0.01, limit_px - stop_px)
                 max_risk_dollars = equity * risk_per_trade
                 shares_by_risk = int(max_risk_dollars // risk_per_share)
 
@@ -209,11 +248,17 @@ def run_backtest(
                 shares_by_size = int(max_pos_dollars // limit_px)
 
                 shares = max(0, min(shares_by_risk, shares_by_size))
-                if shares > 0:
+                if shares <= 0:
+                    diag_totals["shares_sized_to_zero"] += 1
+                    diag_by_day[day]["shares_sized_to_zero"] += 1
+                else:
                     entry_px = _slip(limit_px, slippage_bps, is_buy=True)
                     fees = _commission(shares, commission_per_share, commission_min)
                     cost = shares * entry_px + fees
-                    if cost <= cash:
+                    if cost > cash:
+                        diag_totals["not_enough_cash"] += 1
+                        diag_by_day[day]["not_enough_cash"] += 1
+                    else:
                         cash -= cost
                         positions[t] = Position(
                             ticker=t,
@@ -223,7 +268,7 @@ def run_backtest(
                             stop_price=stop_px,
                             breakeven_set=False,
                         )
-                        last_trade_unlocked = False  # lock until BE
+                        last_trade_unlocked = False
                         log.info("BUY %s %d @ %.2f (limit %.2f) stop %.2f", t, shares, entry_px, limit_px, stop_px)
 
         equity_rows.append(
@@ -238,4 +283,10 @@ def run_backtest(
         )
 
     equity_df = pd.DataFrame(equity_rows)
+
+    # Log top diagnostic reasons
+    if len(trades) == 0:
+        top = diag_totals.most_common(12)
+        log.warning("NO TRADES. Top filter reasons (aggregated): %s", top)
+
     return equity_df, trades
