@@ -58,7 +58,7 @@ def run_backtest(
     """
     Daily bar approximation.
     Returns: equity_df, trades
-    Additionally logs diagnostics about filters.
+    Logs diagnostics about filters.
     """
 
     # Prepare SPY indicators
@@ -113,7 +113,7 @@ def run_backtest(
             h = float(row["high"])
             l = float(row["low"])
 
-            # Move to BE at +1%
+            # Move to BE at +1% (daily proxy)
             if (not pos.breakeven_set) and (h >= pos.entry_price * 1.01):
                 pos.stop_price = pos.entry_price
                 pos.breakeven_set = True
@@ -226,7 +226,6 @@ def run_backtest(
 
             # Aggregate reasons (for days with no trade)
             if not candidates:
-                # take top 5 reasons that day
                 for k, v in day_reasons.items():
                     diag_totals[k] += v
                     diag_by_day[day][k] += v
@@ -282,9 +281,42 @@ def run_backtest(
             }
         )
 
+    # === EOD liquidation for accurate metrics ===
+    if positions:
+        last_i = len(dates) - 1
+        last_day = dates[last_i]
+        for t, pos in list(positions.items()):
+            c = float(prepared[t].iloc[last_i]["close"])
+            exit_px = _slip(c, slippage_bps, is_buy=False)
+            gross = (exit_px - pos.entry_price) * pos.shares
+            fees = _commission(pos.shares, commission_per_share, commission_min)
+            cash += pos.shares * exit_px - fees
+            pnl = gross - fees
+            pnl_pct = (exit_px - pos.entry_price) / pos.entry_price
+            trades.append(
+                Trade(
+                    ticker=t,
+                    entry_date=pos.entry_date,
+                    entry_price=pos.entry_price,
+                    exit_date=last_day,
+                    exit_price=exit_px,
+                    shares=pos.shares,
+                    pnl=pnl,
+                    pnl_pct=pnl_pct,
+                    reason="EOD_LIQUIDATION",
+                )
+            )
+            positions.pop(t, None)
+
+        # update final equity row to reflect liquidation
+        if equity_rows:
+            equity_rows[-1]["cash"] = cash
+            equity_rows[-1]["market_value"] = 0.0
+            equity_rows[-1]["equity"] = cash
+            equity_rows[-1]["positions"] = 0
+
     equity_df = pd.DataFrame(equity_rows)
 
-    # Log top diagnostic reasons
     if len(trades) == 0:
         top = diag_totals.most_common(12)
         log.warning("NO TRADES. Top filter reasons (aggregated): %s", top)
