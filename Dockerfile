@@ -5,16 +5,21 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# System deps (optional but useful for matplotlib)
+# System deps for matplotlib + build wheels if needed
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml /app/pyproject.toml
+# Copy dependencies first (better caching)
+COPY requirements.txt /app/requirements.txt
+RUN pip install -U pip && pip install -r requirements.txt
+
+# Copy app code
 COPY src /app/src
 COPY data /app/data
 COPY README.md /app/README.md
 
-RUN pip install -U pip && pip install -e .
+# Make src importable
+ENV PYTHONPATH=/app/src
 
 CMD ["python", "-m", "poos_backtest.main"]
