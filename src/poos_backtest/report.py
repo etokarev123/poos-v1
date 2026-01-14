@@ -2,7 +2,6 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 from .engine import Trade
 
@@ -43,6 +42,30 @@ def compute_metrics(equity: pd.DataFrame, trades: list[Trade]) -> dict:
         "daily_vol": float(returns.std()) if len(returns) else None,
     }
 
+def _plot_equity(equity: pd.DataFrame, path: str) -> None:
+    plt.figure()
+    plt.plot(pd.to_datetime(equity["date"]), equity["equity"].astype(float))
+    plt.title("Equity Curve (POOS V1)")
+    plt.xlabel("Date")
+    plt.ylabel("Equity")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+def _plot_drawdown(equity: pd.DataFrame, path: str) -> None:
+    eq = equity["equity"].astype(float)
+    peak = eq.cummax()
+    dd = (eq / peak) - 1.0
+
+    plt.figure()
+    plt.plot(pd.to_datetime(equity["date"]), dd.astype(float))
+    plt.title("Drawdown (POOS V1)")
+    plt.xlabel("Date")
+    plt.ylabel("Drawdown")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
 def save_outputs(out_dir: str, equity: pd.DataFrame, trades: list[Trade]) -> dict:
     import os
     os.makedirs(out_dir, exist_ok=True)
@@ -50,7 +73,8 @@ def save_outputs(out_dir: str, equity: pd.DataFrame, trades: list[Trade]) -> dic
     equity_path = os.path.join(out_dir, "equity.csv")
     trades_path = os.path.join(out_dir, "trades.csv")
     metrics_path = os.path.join(out_dir, "metrics.json")
-    plot_path = os.path.join(out_dir, "equity_curve.png")
+    equity_png = os.path.join(out_dir, "equity_curve.png")
+    dd_png = os.path.join(out_dir, "drawdown.png")
 
     equity.to_csv(equity_path, index=False)
 
@@ -63,19 +87,13 @@ def save_outputs(out_dir: str, equity: pd.DataFrame, trades: list[Trade]) -> dic
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
-    # plot
-    plt.figure()
-    plt.plot(pd.to_datetime(equity["date"]), equity["equity"].astype(float))
-    plt.title("Equity Curve (POOS V1)")
-    plt.xlabel("Date")
-    plt.ylabel("Equity")
-    plt.tight_layout()
-    plt.savefig(plot_path, dpi=150)
-    plt.close()
+    _plot_equity(equity, equity_png)
+    _plot_drawdown(equity, dd_png)
 
     return {
         "equity_csv": equity_path,
         "trades_csv": trades_path,
         "metrics_json": metrics_path,
-        "equity_png": plot_path,
+        "equity_png": equity_png,
+        "drawdown_png": dd_png,
     }
