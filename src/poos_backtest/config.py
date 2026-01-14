@@ -12,6 +12,10 @@ def _get_float(name: str, default: float) -> float:
 def _get_int(name: str, default: int) -> int:
     return int(_get_env(name, str(default)))
 
+def _get_bool(name: str, default: bool) -> bool:
+    v = _get_env(name, "1" if default else "0").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
 @dataclass(frozen=True)
 class BacktestConfig:
     bt_days: int
@@ -32,6 +36,12 @@ class BacktestConfig:
     tickers_file: str
     ticker_sector_file: str
     sector_etfs_file: str
+
+    # Auto-universe + auto-sector
+    auto_universe: bool
+    universe_size: int
+    auto_sector_assign: bool
+    sector_assign_lookback: int
 
     r2_endpoint: str
     r2_access_key_id: str
@@ -59,6 +69,11 @@ def load_config() -> BacktestConfig:
         tickers_file=_get_env("BT_TICKERS_FILE", "data/tickers.csv"),
         ticker_sector_file=_get_env("BT_TICKER_SECTOR_FILE", "data/ticker_sector_etf.csv"),
         sector_etfs_file=_get_env("BT_SECTOR_ETFS_FILE", "data/sector_etfs.csv"),
+
+        auto_universe=_get_bool("BT_AUTO_UNIVERSE", False),
+        universe_size=_get_int("BT_UNIVERSE_SIZE", 2000),
+        auto_sector_assign=_get_bool("BT_AUTO_SECTOR_ASSIGN", True),
+        sector_assign_lookback=_get_int("BT_SECTOR_ASSIGN_LOOKBACK", 252),
 
         r2_endpoint=_get_env("R2_ENDPOINT", ""),
         r2_access_key_id=_get_env("R2_ACCESS_KEY_ID", ""),
