@@ -29,10 +29,10 @@ class BacktestConfig:
     commission_per_share: float
     commission_min: float
 
-    min_dollar_volume: float
-    price_max: float
+    # POOS filters
     perf_3m_min: float
 
+    # Universe sources
     tickers_file: str
     ticker_sector_file: str
     sector_etfs_file: str
@@ -42,6 +42,14 @@ class BacktestConfig:
     universe_size: int
     auto_sector_assign: bool
     sector_assign_lookback: int
+
+    # Small/Mid regime filters (B defaults)
+    market_ticker: str  # SPY or IWM
+    price_min: float
+    price_max: float
+    adv20_min: float
+    adv20_max: float
+    min_atr_pct: float
 
     r2_endpoint: str
     r2_access_key_id: str
@@ -62,18 +70,24 @@ def load_config() -> BacktestConfig:
         commission_per_share=_get_float("BT_COMMISSION_PER_SHARE", 0.005),
         commission_min=_get_float("BT_COMMISSION_MIN", 1.0),
 
-        min_dollar_volume=_get_float("BT_MIN_DOLLAR_VOLUME", 5_000_000),
-        price_max=_get_float("BT_PRICE_MAX", 70.0),
         perf_3m_min=_get_float("BT_PERF_3M_MIN", 0.60),
 
         tickers_file=_get_env("BT_TICKERS_FILE", "data/tickers.csv"),
         ticker_sector_file=_get_env("BT_TICKER_SECTOR_FILE", "data/ticker_sector_etf.csv"),
         sector_etfs_file=_get_env("BT_SECTOR_ETFS_FILE", "data/sector_etfs.csv"),
 
-        auto_universe=_get_bool("BT_AUTO_UNIVERSE", False),
+        auto_universe=_get_bool("BT_AUTO_UNIVERSE", True),
         universe_size=_get_int("BT_UNIVERSE_SIZE", 2000),
         auto_sector_assign=_get_bool("BT_AUTO_SECTOR_ASSIGN", True),
         sector_assign_lookback=_get_int("BT_SECTOR_ASSIGN_LOOKBACK", 252),
+
+        # Regime B defaults (small+mid)
+        market_ticker=_get_env("BT_MARKET_TICKER", "IWM").strip().upper(),
+        price_min=_get_float("BT_PRICE_MIN", 2.0),
+        price_max=_get_float("BT_PRICE_MAX", 50.0),
+        adv20_min=_get_float("BT_ADV20_MIN", 2_000_000.0),
+        adv20_max=_get_float("BT_ADV20_MAX", 80_000_000.0),
+        min_atr_pct=_get_float("BT_MIN_ATR_PCT", 0.02),
 
         r2_endpoint=_get_env("R2_ENDPOINT", ""),
         r2_access_key_id=_get_env("R2_ACCESS_KEY_ID", ""),
