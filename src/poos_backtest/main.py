@@ -15,6 +15,7 @@ from .universe import read_tickers_csv, read_sector_etfs_csv, read_ticker_sector
 from .universe_nasdaq import NasdaqSymbolDirectory
 from .engine import run_backtest
 from .report import save_outputs, compute_metrics
+from .indicators import atr
 
 log = logging.getLogger(__name__)
 
@@ -39,11 +40,6 @@ def _auto_assign_sector_by_corr(
     sectors: dict[str, pd.DataFrame],
     lookback: int,
 ) -> dict[str, str]:
-    """
-    Assign each stock to the sector ETF with the highest correlation of daily returns
-    over the last `lookback` bars (using close-to-close returns).
-    This keeps a sector layer without paid fundamentals.
-    """
     sector_list = sorted(sectors.keys())
     sector_rets = {}
     for s in sector_list:
@@ -53,7 +49,6 @@ def _auto_assign_sector_by_corr(
     mapping: dict[str, str] = {}
     for t, df in stocks.items():
         r = df["close"].astype(float).pct_change().replace([np.inf, -np.inf], np.nan)
-        # use trailing window (skip if too short)
         if r.dropna().shape[0] < max(60, lookback // 2):
             continue
         r_win = r.tail(lookback)
@@ -76,15 +71,57 @@ def _auto_assign_sector_by_corr(
 
     return mapping
 
-def _write_summary(out_dir: str, run_id: str, cfg_dict: dict, metrics: dict) -> str:
+def _prefilter_small_mid(
+    stocks: dict[str, pd.DataFrame],
+    *,
+    price_min: float,
+    price_max: float,
+    adv20_min: float,
+    adv20_max: float,
+    min_atr_pct: float,
+) -> dict[str, pd.DataFrame]:
+    """
+    Operational small/mid caps filter:
+    - last close in [price_min, price_max]
+    - ADV20 in [adv20_min, adv20_max]
+    - ATR14/close >= min_atr_pct (on last bar)
+    """
+    out = {}
+    for t, df in stocks.items():
+        d = df.copy()
+        d["dollar_vol"] = d["close"].astype(float) * d["volume"].astype(float)
+        d["adv20"] = d["dollar_vol"].rolling(20).mean()
+        d["atr14"] = atr(d, 14)
+        # last row
+        last = d.iloc[-1]
+        px = float(last["close"])
+        adv = float(last["adv20"]) if not np.isnan(last["adv20"]) else np.nan
+        a = float(last["atr14"]) if not np.isnan(last["atr14"]) else np.nan
+        if np.isnan(adv) or np.isnan(a) or px <= 0:
+            continue
+        atr_pct = a / px
+
+        if not (price_min <= px <= price_max):
+            continue
+        if not (adv20_min <= adv <= adv20_max):
+            continue
+        if atr_pct < min_atr_pct:
+            continue
+
+        out[t] = df
+    return out
+
+def _write_summary(out_dir: str, run_id: str, cfg_dict: dict, metrics: dict, universe_stats: dict) -> str:
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "summary.txt")
+    payload = {
+        "run_id": run_id,
+        "config": cfg_dict,
+        "universe_stats": universe_stats,
+        "metrics": metrics,
+    }
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"RUN: {run_id}\n\n")
-        f.write("CONFIG:\n")
-        f.write(json.dumps(cfg_dict, indent=2))
-        f.write("\n\nMETRICS:\n")
-        f.write(json.dumps(metrics, indent=2))
+        f.write(json.dumps(payload, indent=2))
         f.write("\n")
     return path
 
@@ -114,17 +151,9 @@ def main() -> None:
         tickers = read_tickers_csv(cfg.tickers_file)
         log.info("Universe tickers: %d (from %s)", len(tickers), cfg.tickers_file)
 
-    # Sector mapping
-    ticker_to_sector: dict[str, str] = {}
-    if (not cfg.auto_sector_assign):
-        ticker_to_sector = read_ticker_sector_map(cfg.ticker_sector_file)
-        log.info("Sector map rows: %d (from %s)", len(ticker_to_sector), cfg.ticker_sector_file)
-    else:
-        log.info("AUTO sector assign enabled (corr lookback=%d). Will build mapping from prices.", cfg.sector_assign_lookback)
-
     stooq = StooqClient.create()
 
-    # Load ETF data (SPY + sectors)
+    # Load sector ETFs
     etf_dfs: dict[str, pd.DataFrame] = {}
     for t in sector_etfs:
         try:
@@ -135,8 +164,21 @@ def main() -> None:
         except Exception as e:
             log.warning("ETF %s failed: %s", t, e)
 
-    if "SPY" not in etf_dfs:
-        raise RuntimeError("Failed to load SPY from Stooq. Cannot run backtest.")
+    # Load market regime ticker (IWM default)
+    market_ticker = cfg.market_ticker
+    if market_ticker not in etf_dfs:
+        # try load it even if not listed in sector_etfs.csv
+        try:
+            mdf = stooq.fetch_daily(market_ticker)
+            mdf = clip_date_range(mdf, start, end)
+            etf_dfs[market_ticker] = mdf
+            log.info("Loaded Market %s rows=%d", market_ticker, len(mdf))
+        except Exception as e:
+            raise RuntimeError(f"Failed to load market ticker {market_ticker}: {e}")
+
+    # Master dates based on market ticker (IWM)
+    market_df = etf_dfs[market_ticker].copy()
+    master_dates = market_df["date"].tolist()
 
     # Load stocks
     stock_dfs: dict[str, pd.DataFrame] = {}
@@ -145,8 +187,7 @@ def main() -> None:
         try:
             df = stooq.fetch_daily(t)
             df = clip_date_range(df, start, end)
-            # quick sanity: need enough rows
-            if len(df) < 100:
+            if len(df) < 120:
                 fail += 1
                 continue
             stock_dfs[t] = df
@@ -155,22 +196,43 @@ def main() -> None:
             fail += 1
     log.info("Stocks loaded ok=%d failed=%d (requested=%d)", ok, fail, len(tickers))
 
-    # Master dates from SPY
-    spy = etf_dfs["SPY"].copy()
-    master_dates = spy["date"].tolist()
-
+    # Align all series to market dates
     aligned_etfs = _align_on_dates(etf_dfs, master_dates)
     aligned_stocks = _align_on_dates(stock_dfs, master_dates)
 
     aligned_etfs = _drop_bad(aligned_etfs)
     aligned_stocks = _drop_bad(aligned_stocks)
 
-    # Sector dfs excluding SPY
-    sector_dfs = {t: df for t, df in aligned_etfs.items() if t != "SPY"}
+    # Sector dfs excluding SPY and excluding market ticker if it is IWM
+    sector_dfs = {}
+    for t, df in aligned_etfs.items():
+        if t in ("SPY", market_ticker):
+            continue
+        sector_dfs[t] = df
+
+    universe_before = len(aligned_stocks)
+
+    # Prefilter operational small+mid caps
+    aligned_stocks = _prefilter_small_mid(
+        aligned_stocks,
+        price_min=cfg.price_min,
+        price_max=cfg.price_max,
+        adv20_min=cfg.adv20_min,
+        adv20_max=cfg.adv20_max,
+        min_atr_pct=cfg.min_atr_pct,
+    )
+
+    universe_after = len(aligned_stocks)
+    log.info("Small+Mid prefilter: before=%d after=%d (price %.2f-%.2f, ADV20 %.0f-%.0f, ATR%%>=%.2f%%)",
+             universe_before, universe_after,
+             cfg.price_min, cfg.price_max,
+             cfg.adv20_min, cfg.adv20_max,
+             cfg.min_atr_pct * 100.0)
 
     log.info("After gap-drop: ETFs=%d Stocks=%d", len(aligned_etfs), len(aligned_stocks))
 
-    # Build sector mapping from correlation if enabled
+    # Sector mapping
+    ticker_to_sector: dict[str, str] = {}
     if cfg.auto_sector_assign:
         ticker_to_sector = _auto_assign_sector_by_corr(
             stocks=aligned_stocks,
@@ -179,11 +241,16 @@ def main() -> None:
         )
         log.info("AUTO sector mapping built: %d tickers mapped (out of %d loaded stocks)",
                  len(ticker_to_sector), len(aligned_stocks))
+    else:
+        ticker_to_sector = read_ticker_sector_map(cfg.ticker_sector_file)
+        log.info("Sector map rows: %d (from %s)", len(ticker_to_sector), cfg.ticker_sector_file)
 
+    # IMPORTANT: engine expects `spy` df for risk_on calculation.
+    # We pass MARKET df in place of "spy" so that risk_on is based on IWM in this regime.
     equity, trades = run_backtest(
         start_cash=cfg.start_cash,
         dates=master_dates,
-        spy=aligned_etfs["SPY"],
+        spy=aligned_etfs[market_ticker],
         sector_dfs=sector_dfs,
         stock_dfs=aligned_stocks,
         ticker_to_sector=ticker_to_sector,
@@ -192,7 +259,7 @@ def main() -> None:
         slippage_bps=cfg.slippage_bps,
         commission_per_share=cfg.commission_per_share,
         commission_min=cfg.commission_min,
-        min_dollar_volume=cfg.min_dollar_volume,
+        min_dollar_volume=cfg.adv20_min,   # keep engine’s min filter aligned to ADV20 min baseline
         price_max=cfg.price_max,
         perf_3m_min=cfg.perf_3m_min,
     )
@@ -212,9 +279,16 @@ def main() -> None:
     )
 
     paths = save_outputs(out_dir, equity, trades)
-    summary_path = _write_summary(out_dir, run_id, cfg.__dict__, metrics)
 
-    # Upload outputs to R2
+    universe_stats = {
+        "auto_universe_requested": cfg.universe_size,
+        "loaded_stocks_before_prefilter": universe_before,
+        "stocks_after_small_mid_prefilter": universe_after,
+        "mapped_to_sector": len(ticker_to_sector),
+        "market_ticker_for_regime": market_ticker,
+    }
+    summary_path = _write_summary(out_dir, run_id, cfg.__dict__, metrics, universe_stats)
+
     for _, p in paths.items():
         key = f"{run_id}/{os.path.basename(p)}"
         r2.upload_file(p, key)
